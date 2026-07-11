@@ -27,6 +27,8 @@ from bot.config import (
     TIMEFRAMES,
     CANDLE_REFRESH_INTERVAL,
     INSTRUMENTS_REFRESH_INTERVAL,
+    ALERT_ON_LOW_SWEEP,
+    ALERT_ON_HIGH_SWEEP,
 )
 from bot.okx_client import (
     fetch_usdt_spot_symbols,
@@ -90,16 +92,24 @@ class Monitor:
             prev_high = candle["high"]
             prev_low = candle["low"]
 
-            # High Sweep check
-            if price > prev_high and self.state.should_alert_high(symbol, bar):
+            # High Sweep check (potential SELL setup) — disabled by default
+            if (
+                ALERT_ON_HIGH_SWEEP
+                and price > prev_high
+                and self.state.should_alert_high(symbol, bar)
+            ):
                 self.state.mark_high_alerted(symbol, bar)
                 await send_alert(
                     session, symbol, bar, "high",
                     price, prev_high, prev_low,
                 )
 
-            # Low Sweep check
-            elif price < prev_low and self.state.should_alert_low(symbol, bar):
+            # Low Sweep check (potential BUY setup) — enabled by default
+            elif (
+                ALERT_ON_LOW_SWEEP
+                and price < prev_low
+                and self.state.should_alert_low(symbol, bar)
+            ):
                 self.state.mark_low_alerted(symbol, bar)
                 await send_alert(
                     session, symbol, bar, "low",

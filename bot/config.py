@@ -23,6 +23,13 @@ TIMEFRAMES: dict[str, str] = {
     "Daily":   "1D",
 }
 
+# ── Which sweep types trigger alerts ──────────────────────────────────────────
+# Low Sweep  (price breaks below previous candle's low) → potential BUY setup
+# High Sweep (price breaks above previous candle's high) → potential SELL setup
+# User only wants buy-side setups, so High Sweep alerts are disabled by default.
+ALERT_ON_LOW_SWEEP: bool = True
+ALERT_ON_HIGH_SWEEP: bool = False
+
 # How often (seconds) to refresh previous-candle data for each timeframe.
 # We refresh often enough to pick up new candles without hammering the API.
 CANDLE_REFRESH_INTERVAL: dict[str, int] = {
