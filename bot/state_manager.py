@@ -15,6 +15,7 @@ Layout of _state dict
       "low":  68000.0,
       "high_alerted": False,
       "low_alerted":  False,
+      "primed": False,   # False until the first live tick has been evaluated
     },
     "1W": { ... },
     "1M": { ... },
@@ -64,6 +65,7 @@ class StateManager:
                     "low": low,
                     "high_alerted": False,
                     "low_alerted": False,
+                    "primed": False,
                 }
             else:
                 # Same candle – refresh prices in case of late corrections
@@ -102,6 +104,50 @@ class StateManager:
             candle = self._state.get(symbol, {}).get(bar)
             if candle:
                 candle["low_alerted"] = True
+
+    def evaluate_tick(
+        self, symbol: str, bar: str, price: float
+    ) -> Optional[tuple[str, float, float]]:
+        """
+        Evaluate a live price tick against the stored candle and decide
+        whether a fresh sweep alert should fire.
+
+        Returns (sweep_type, prev_high, prev_low) if an alert should be sent,
+        otherwise None.
+
+        Priming: the first tick evaluated after a candle is (re)loaded only
+        establishes a baseline — if price is already outside the high/low
+        range at that point (e.g. right after a bot restart or redeploy),
+        it is marked as already-alerted WITHOUT sending a notification, so
+        the bot never re-announces a sweep that happened before it started
+        or before this candle was loaded. Only crossings that happen while
+        the bot is actively watching trigger a real alert.
+        """
+        with self._lock:
+            candle = self._state.get(symbol, {}).get(bar)
+            if candle is None:
+                return None
+
+            prev_high = candle["high"]
+            prev_low = candle["low"]
+
+            if not candle.get("primed", False):
+                candle["primed"] = True
+                if price > prev_high:
+                    candle["high_alerted"] = True
+                if price < prev_low:
+                    candle["low_alerted"] = True
+                return None
+
+            if price > prev_high and not candle["high_alerted"]:
+                candle["high_alerted"] = True
+                return ("high", prev_high, prev_low)
+
+            if price < prev_low and not candle["low_alerted"]:
+                candle["low_alerted"] = True
+                return ("low", prev_high, prev_low)
+
+            return None
 
     # ── helpers ───────────────────────────────────────────────────────────────
 

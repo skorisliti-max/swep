@@ -85,32 +85,18 @@ class Monitor:
         bars = list(TIMEFRAMES.values())   # ["1M", "1W", "1D"]
 
         for bar in bars:
-            candle = self.state.get_candle(symbol, bar)
-            if candle is None:
+            result = self.state.evaluate_tick(symbol, bar, price)
+            if result is None:
                 continue
 
-            prev_high = candle["high"]
-            prev_low = candle["low"]
+            sweep_type, prev_high, prev_low = result
 
-            # High Sweep check (potential SELL setup) — disabled by default
-            if (
-                ALERT_ON_HIGH_SWEEP
-                and price > prev_high
-                and self.state.should_alert_high(symbol, bar)
-            ):
-                self.state.mark_high_alerted(symbol, bar)
+            if sweep_type == "high" and ALERT_ON_HIGH_SWEEP:
                 await send_alert(
                     session, symbol, bar, "high",
                     price, prev_high, prev_low,
                 )
-
-            # Low Sweep check (potential BUY setup) — enabled by default
-            elif (
-                ALERT_ON_LOW_SWEEP
-                and price < prev_low
-                and self.state.should_alert_low(symbol, bar)
-            ):
-                self.state.mark_low_alerted(symbol, bar)
+            elif sweep_type == "low" and ALERT_ON_LOW_SWEEP:
                 await send_alert(
                     session, symbol, bar, "low",
                     price, prev_high, prev_low,
