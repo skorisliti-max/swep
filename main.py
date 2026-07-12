@@ -11,7 +11,10 @@ Environment variables required:
 
 import asyncio
 import logging
+import os
 import sys
+
+from aiohttp import web
 
 # Validate env vars early so we fail fast with a clear message.
 try:
@@ -35,12 +38,38 @@ def _configure_logging() -> None:
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
 
+async def _run_health_server() -> None:
+    """
+    Render deploys this as a Web Service, which requires the process to bind
+    to $PORT and answer HTTP requests — otherwise Render's health check times
+    out and marks the deploy as failed, even though the bot itself is fine.
+    This tiny server exists only to satisfy that requirement.
+    """
+    async def health(_request: web.Request) -> web.Response:
+        return web.Response(text="OK")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+
+    port = int(os.environ.get("PORT", 8080))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
+    await site.start()
+
+    logging.getLogger("main").info(f"Health check server listening on port {port}")
+
+    # Keep this coroutine alive forever alongside the monitor.
+    await asyncio.Event().wait()
+
+
 async def _main() -> None:
     _configure_logging()
     logger = logging.getLogger("main")
     logger.info("Starting OKX Liquidity Sweep Bot …")
     monitor = Monitor()
-    await monitor.run()
+    await asyncio.gather(monitor.run(), _run_health_server())
 
 
 if __name__ == "__main__":
