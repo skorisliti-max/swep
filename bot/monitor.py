@@ -3,7 +3,8 @@ Main monitoring orchestrator.
 
 Lifecycle
 ─────────
-1. Fetch all USDT-SPOT symbols from OKX REST.
+1. Fetch all USDT-SPOT symbols from OKX REST and Binance.
+   OKX is preferred; Binance supplies symbols missing from OKX.
 2. Bulk-load previous candle data for all symbols × 3 timeframes.
 3. Open WebSocket streams to receive real-time ticker prices.
 4. On every tick:
@@ -19,22 +20,27 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
-
 import aiohttp
 
 from bot.config import (
     TIMEFRAMES,
+    WATCHLIST_SYMBOLS,
     CANDLE_REFRESH_INTERVAL,
     INSTRUMENTS_REFRESH_INTERVAL,
     ALERT_ON_LOW_SWEEP,
     ALERT_ON_HIGH_SWEEP,
 )
 from bot.okx_client import (
-    fetch_usdt_spot_symbols,
-    fetch_previous_candle,
-    bulk_fetch_candles,
-    run_websocket_streams,
+    fetch_usdt_spot_symbols as fetch_okx_symbols,
+    fetch_previous_candle as fetch_okx_candle,
+    bulk_fetch_candles as bulk_fetch_okx_candles,
+    run_websocket_streams as run_okx_streams,
+)
+from bot.binance_client import (
+    fetch_usdt_spot_symbols as fetch_binance_symbols,
+    fetch_previous_candle as fetch_binance_candle,
+    bulk_fetch_candles as bulk_fetch_binance_candles,
+    run_websocket_streams as run_binance_streams,
 )
 from bot.state_manager import StateManager
 from bot.notifier import send_alert, send_startup_message
@@ -46,7 +52,142 @@ class Monitor:
     def __init__(self) -> None:
         self.state = StateManager()
         self._symbols: list[str] = []
+        self._source_by_symbol: dict[str, str] = {}
+        self._unavailable_symbols: list[str] = []
+        self._candle_gaps: dict[str, list[str]] = {}
+        self._loaded_bars: set[tuple[str, str]] = set()
         self._stop = asyncio.Event()
+
+    @staticmethod
+    def _select_watchlist(symbols: list[str]) -> list[str]:
+        """Keep watchlist symbols that are present in one market-data source."""
+        available = set(symbols)
+        return [symbol for symbol in WATCHLIST_SYMBOLS if symbol in available]
+
+    @staticmethod
+    def _build_source_map(
+        okx_symbols: list[str],
+        binance_symbols: list[str],
+    ) -> dict[str, str]:
+        """Prefer OKX and use Binance for watchlist symbols absent from OKX."""
+        okx_available = set(okx_symbols)
+        binance_available = set(binance_symbols)
+        return {
+            symbol: ("okx" if symbol in okx_available else "binance")
+            for symbol in WATCHLIST_SYMBOLS
+            if symbol in okx_available or symbol in binance_available
+        }
+
+    async def _fetch_source_symbols(
+        self,
+        session: aiohttp.ClientSession,
+    ) -> tuple[list[str], list[str]]:
+        """Fetch both source listings without losing a working source on error."""
+        results = await asyncio.gather(
+            fetch_okx_symbols(session),
+            fetch_binance_symbols(session),
+            return_exceptions=True,
+        )
+        sources: list[list[str]] = []
+        for source_name, result in zip(("OKX", "Binance"), results):
+            if isinstance(result, Exception):
+                logger.warning("%s instrument discovery failed: %s", source_name, result)
+                sources.append([])
+            else:
+                sources.append(result)
+        return sources[0], sources[1]
+
+    def _apply_source_map(
+        self,
+        source_map: dict[str, str],
+        *,
+        log_context: str,
+    ) -> tuple[list[str], list[str]]:
+        """Store source selection and return newly added and removed symbols."""
+        previous_symbols = set(self._symbols)
+        self._source_by_symbol = source_map
+        self._symbols = list(source_map)
+        self._unavailable_symbols = [
+            symbol for symbol in WATCHLIST_SYMBOLS if symbol not in source_map
+        ]
+        added = [symbol for symbol in self._symbols if symbol not in previous_symbols]
+        removed = [symbol for symbol in previous_symbols if symbol not in source_map]
+
+        logger.info(
+            "%s: monitoring %d/%d requested symbols",
+            log_context,
+            len(self._symbols),
+            len(WATCHLIST_SYMBOLS),
+        )
+        if self._symbols:
+            logger.info(
+                "Source selection: %s",
+                ", ".join(
+                    f"{symbol}={self._source_by_symbol[symbol]}"
+                    for symbol in self._symbols
+                ),
+            )
+        if self._unavailable_symbols:
+            logger.warning(
+                "Unavailable watchlist symbols (no OKX or Binance market data): %s",
+                ", ".join(self._unavailable_symbols),
+            )
+        return added, removed
+
+    def _source_symbols(self, source: str) -> list[str]:
+        return [
+            symbol
+            for symbol in self._symbols
+            if self._source_by_symbol.get(symbol) == source
+        ]
+
+    async def _fetch_candle(
+        self,
+        session: aiohttp.ClientSession,
+        symbol: str,
+        bar: str,
+    ) -> dict | None:
+        if self._source_by_symbol.get(symbol) == "binance":
+            return await fetch_binance_candle(session, symbol, bar)
+        return await fetch_okx_candle(session, symbol, bar)
+
+    async def _bulk_fetch_candles(
+        self,
+        session: aiohttp.ClientSession,
+        symbols: list[str],
+        bars: list[str],
+    ) -> None:
+        """Load candles using each symbol's selected source."""
+        for source, fetcher in (
+            ("okx", bulk_fetch_okx_candles),
+            ("binance", bulk_fetch_binance_candles),
+        ):
+            source_symbols = [
+                symbol
+                for symbol in symbols
+                if self._source_by_symbol.get(symbol) == source
+            ]
+            if source_symbols:
+                await fetcher(
+                    session,
+                    source_symbols,
+                    bars,
+                    self._candle_store_callback,
+                )
+
+        requested = {(symbol, bar) for symbol in symbols for bar in bars}
+        missing = requested - self._loaded_bars
+        self._candle_gaps = {}
+        for symbol, bar in sorted(missing):
+            self._candle_gaps.setdefault(symbol, []).append(bar)
+        if self._candle_gaps:
+            logger.warning(
+                "Missing candle data; those timeframes cannot alert: %s",
+                ", ".join(
+                    f"{symbol} ({', '.join(bars)})"
+                    for symbol, bars in sorted(self._candle_gaps.items())
+                ),
+            )
 
     # ── candle helpers ────────────────────────────────────────────────────────
 
@@ -56,12 +197,13 @@ class Monitor:
         symbol: str,
         bar: str,
     ) -> None:
-        candle = await fetch_previous_candle(session, symbol, bar)
+        candle = await self._fetch_candle(session, symbol, bar)
         if candle:
             self.state.update_candle(
                 symbol, bar,
                 candle["open_ts"], candle["high"], candle["low"],
             )
+            self._loaded_bars.add((symbol, bar))
 
     async def _candle_store_callback(
         self,
@@ -72,6 +214,7 @@ class Monitor:
         low: float,
     ) -> None:
         self.state.update_candle(symbol, bar, open_ts, high, low)
+        self._loaded_bars.add((symbol, bar))
 
     # ── ticker callback ───────────────────────────────────────────────────────
 
@@ -82,6 +225,12 @@ class Monitor:
         price: float,
     ) -> None:
         """Called for every real-time price update received via WebSocket."""
+        # Final safety gate: stale/reconnected streams must never produce
+        # alerts for symbols outside the fixed 12-symbol watchlist.
+        if symbol not in WATCHLIST_SYMBOLS or symbol not in self._source_by_symbol:
+            logger.debug("Ignoring ticker outside selected watchlist: %s", symbol)
+            return
+
         bars = list(TIMEFRAMES.values())   # ["1M", "1W", "1D"]
 
         for bar in bars:
@@ -117,12 +266,13 @@ class Monitor:
             for symbol in list(self._symbols):
                 if self._stop.is_set():
                     break
-                candle = await fetch_previous_candle(session, symbol, bar)
+                candle = await self._fetch_candle(session, symbol, bar)
                 if candle:
                     self.state.update_candle(
                         symbol, bar,
                         candle["open_ts"], candle["high"], candle["low"],
                     )
+                    self._loaded_bars.add((symbol, bar))
 
     async def _instruments_refresh_loop(self, session: aiohttp.ClientSession) -> None:
         """Daily refresh of the full instrument list."""
@@ -130,15 +280,28 @@ class Monitor:
             await asyncio.sleep(INSTRUMENTS_REFRESH_INTERVAL)
             logger.info("Refreshing instrument list …")
             try:
-                new_symbols = await fetch_usdt_spot_symbols(session)
-                added = [s for s in new_symbols if s not in self._symbols]
-                if added:
-                    logger.info("New USDT pairs detected: %s", added)
-                    bars = list(TIMEFRAMES.values())
-                    await bulk_fetch_candles(
-                        session, added, bars, self._candle_store_callback
+                okx_symbols, binance_symbols = await self._fetch_source_symbols(session)
+                previous_sources = dict(self._source_by_symbol)
+                new_source_map = self._build_source_map(okx_symbols, binance_symbols)
+                added, removed = self._apply_source_map(
+                    new_source_map,
+                    log_context="Watchlist refresh",
+                )
+                changed_source = [
+                    symbol
+                    for symbol in self._symbols
+                    if previous_sources.get(symbol) not in (None, new_source_map[symbol])
+                ]
+                to_load = added + changed_source
+                if to_load:
+                    logger.info(
+                        "Loading candles for new/source-changed symbols: %s",
+                        ", ".join(to_load),
                     )
-                    self._symbols = new_symbols
+                    bars = list(TIMEFRAMES.values())
+                    await self._bulk_fetch_candles(session, to_load, bars)
+                if removed:
+                    logger.info("Watchlist pairs no longer available: %s", ", ".join(removed))
             except Exception as exc:
                 logger.warning("Instrument refresh error: %s", exc)
 
@@ -150,7 +313,11 @@ class Monitor:
 
             # 1. Fetch instrument list
             logger.info("Fetching USDT instrument list …")
-            self._symbols = await fetch_usdt_spot_symbols(session)
+            okx_symbols, binance_symbols = await self._fetch_source_symbols(session)
+            self._apply_source_map(
+                self._build_source_map(okx_symbols, binance_symbols),
+                log_context="Watchlist selected",
+            )
 
             # 2. Bulk-load previous candles (runs before WebSocket opens)
             bars = list(TIMEFRAMES.values())
@@ -158,16 +325,25 @@ class Monitor:
                 "Loading previous candles for %d symbols × %d timeframes …",
                 len(self._symbols), len(bars),
             )
-            await bulk_fetch_candles(
-                session, self._symbols, bars, self._candle_store_callback
-            )
+            await self._bulk_fetch_candles(session, self._symbols, bars)
             logger.info(
                 "Candle init done. Monitoring %d symbols.",
                 self.state.symbol_count(),
             )
 
             # 3. Send startup message
-            await send_startup_message(session, self.state.symbol_count())
+            source_summary = (
+                f"OKX {len(self._source_symbols('okx'))}; "
+                f"Binance fallback {len(self._source_symbols('binance'))}"
+            )
+            await send_startup_message(
+                session,
+                self.state.symbol_count(),
+                requested_count=len(WATCHLIST_SYMBOLS),
+                unavailable_symbols=self._unavailable_symbols,
+                candle_gaps=self._candle_gaps,
+                source_summary=source_summary,
+            )
 
             # 4. Build the on_tick closure that captures the session
             async def on_tick(symbol: str, price: float) -> None:
@@ -191,7 +367,38 @@ class Monitor:
 
             # 6. Open WebSocket streams (blocks until stopped)
             try:
-                await run_websocket_streams(self._symbols, on_tick, self._stop)
+                stream_tasks: list[asyncio.Task] = []
+                okx_stream_symbols = self._source_symbols("okx")
+                binance_stream_symbols = self._source_symbols("binance")
+                if okx_stream_symbols:
+                    stream_tasks.append(
+                        asyncio.create_task(
+                            run_okx_streams(
+                                okx_stream_symbols,
+                                on_tick,
+                                self._stop,
+                            ),
+                            name="okx-tickers",
+                        )
+                    )
+                if binance_stream_symbols:
+                    stream_tasks.append(
+                        asyncio.create_task(
+                            run_binance_streams(
+                                binance_stream_symbols,
+                                on_tick,
+                                self._stop,
+                            ),
+                            name="binance-tickers",
+                        )
+                    )
+                if stream_tasks:
+                    await asyncio.gather(*stream_tasks)
+                else:
+                    logger.warning(
+                        "No market-data streams available; waiting for instrument refresh"
+                    )
+                    await self._stop.wait()
             finally:
                 self._stop.set()
                 for t in bg_tasks:

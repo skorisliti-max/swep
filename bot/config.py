@@ -15,13 +15,37 @@ TELEGRAM_CHAT_ID: str = os.environ["TELEGRAM_CHAT_ID"]
 OKX_REST_BASE = "https://www.okx.com"
 OKX_WS_PUBLIC = "wss://ws.okx.com:8443/ws/v5/public"
 
+# ── Binance fallback endpoints ────────────────────────────────────────────────
+# These dedicated public market-data domains remain usable when the primary
+# Binance API is geographically restricted. No API key is required.
+BINANCE_REST_BASE = "https://data-api.binance.vision"
+BINANCE_WS_PUBLIC = "wss://data-stream.binance.vision/stream"
+
 # ── Timeframes to monitor ─────────────────────────────────────────────────────
-# Maps human-readable label → OKX bar parameter
+# Maps human-readable label → canonical bar parameter used by both clients
 TIMEFRAMES: dict[str, str] = {
     "Monthly": "1M",
     "Weekly":  "1W",
     "Daily":   "1D",
 }
+
+# ── Symbols to monitor ────────────────────────────────────────────────────────
+# Keep this list aligned with the selected Binance/TradingView watchlist.
+# Both clients normalize symbols to BASE-USDT.
+WATCHLIST_SYMBOLS: tuple[str, ...] = (
+    "XPL-USDT",
+    "PEOPLE-USDT",
+    "RED-USDT",
+    "PENGU-USDT",
+    "BANANAS31-USDT",
+    "PUMP-USDT",
+    "CRV-USDT",
+    "SUI-USDT",
+    "FIL-USDT",
+    "FET-USDT",
+    "BTC-USDT",
+    "WLD-USDT",
+)
 
 # ── Which sweep types trigger alerts ──────────────────────────────────────────
 # Low Sweep  (price breaks below previous candle's low) → potential BUY setup

@@ -1,5 +1,5 @@
 """
-Entry point – OKX Liquidity Sweep Telegram Bot.
+Entry point – Liquidity Sweep Telegram Bot.
 
 Run locally:
   python main.py
@@ -67,7 +67,7 @@ async def _run_health_server() -> None:
 async def _main() -> None:
     _configure_logging()
     logger = logging.getLogger("main")
-    logger.info("Starting OKX Liquidity Sweep Bot …")
+    logger.info("Starting Liquidity Sweep Bot …")
     monitor = Monitor()
     await asyncio.gather(monitor.run(), _run_health_server())
 

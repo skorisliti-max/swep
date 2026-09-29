@@ -99,13 +99,42 @@ async def send_alert(
                 await asyncio.sleep(2)
 
 
-async def send_startup_message(session: aiohttp.ClientSession, symbol_count: int) -> None:
+async def send_startup_message(
+    session: aiohttp.ClientSession,
+    symbol_count: int,
+    requested_count: int | None = None,
+    unavailable_symbols: list[str] | None = None,
+    candle_gaps: dict[str, list[str]] | None = None,
+    source_summary: str | None = None,
+) -> None:
     """Inform the chat that the bot has started."""
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    if requested_count is None:
+        requested_count = symbol_count
+    unavailable_symbols = unavailable_symbols or []
+    candle_gaps = candle_gaps or {}
+    details = [
+        f"Monitoring *{symbol_count}/{requested_count}* requested symbols",
+        "Timeframes: Daily · Weekly · Monthly",
+    ]
+    if source_summary:
+        details.append(f"Sources: {source_summary}")
+    if unavailable_symbols:
+        details.append(
+            "*Unavailable:* " + ", ".join(f"`{symbol}`" for symbol in unavailable_symbols)
+        )
+    if candle_gaps:
+        details.append(
+            "*Missing candles:* "
+            + ", ".join(
+                f"`{symbol}` ({', '.join(bars)})"
+                for symbol, bars in sorted(candle_gaps.items())
+            )
+        )
     text = (
-        "✅ *OKX Liquidity Sweep Bot Started*\n"
-        f"Monitoring *{symbol_count}* USDT pairs\n"
-        "Timeframes: Daily · Weekly · Monthly\n"
+        "✅ *Liquidity Sweep Bot Started*\n"
+        + "\n".join(details)
+        + "\n"
         f"_Started at {now_utc}_"
     )
     payload = {
