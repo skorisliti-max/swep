@@ -29,6 +29,15 @@ TIMEFRAMES: dict[str, str] = {
     "Daily":   "1D",
 }
 
+# ── SMA crossover alert ───────────────────────────────────────────────────────
+# The crossover is evaluated only from completed five-minute candles.
+SMA_BAR: str = "5m"
+SMA_FAST_PERIOD: int = 9
+SMA_SLOW_PERIOD: int = 14
+# One open candle plus 15 closed candles gives us two consecutive SMA values.
+SMA_CANDLE_LIMIT: int = SMA_SLOW_PERIOD + 2
+SMA_REFRESH_INTERVAL: int = 60
+
 # ── Symbols to monitor ────────────────────────────────────────────────────────
 # Keep this list aligned with the selected Binance/TradingView watchlist.
 # Both clients normalize symbols to BASE-USDT.

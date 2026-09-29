@@ -24,6 +24,7 @@ from bot.config import (
     CANDLE_FETCH_DELAY,
     WS_PING_INTERVAL,
     WS_SYMBOLS_PER_CONNECTION,
+    SMA_CANDLE_LIMIT,
 )
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,44 @@ async def fetch_previous_candle(
     except (IndexError, ValueError) as exc:
         logger.debug("Candle parse error %s %s: %s", symbol, bar, exc)
         return None
+
+
+async def fetch_sma_candles(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    bar: str = "5m",
+) -> list[dict]:
+    """
+    Return the most recent completed candles in chronological order.
+
+    OKX returns candles newest-first. The newest row can still be open, so it
+    is discarded before returning the following rows.
+    """
+    url = f"{OKX_REST_BASE}/api/v5/market/candles"
+    params = {"instId": symbol, "bar": bar, "limit": SMA_CANDLE_LIMIT}
+
+    try:
+        async with session.get(
+            url, params=params, timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            if resp.status != 200:
+                logger.debug("SMA candle fetch %s HTTP %s", symbol, resp.status)
+                return []
+            data = await resp.json()
+    except Exception as exc:
+        logger.debug("SMA candle fetch error %s %s: %s", symbol, bar, exc)
+        return []
+
+    rows = data.get("data", [])
+    closed_rows = rows[1:SMA_CANDLE_LIMIT]
+    candles: list[dict] = []
+    try:
+        for row in reversed(closed_rows):
+            candles.append({"open_ts": int(row[0]), "close": float(row[4])})
+    except (IndexError, TypeError, ValueError) as exc:
+        logger.debug("SMA candle parse error %s %s: %s", symbol, bar, exc)
+        return []
+    return candles
 
 
 async def bulk_fetch_candles(

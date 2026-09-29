@@ -99,6 +99,67 @@ async def send_alert(
                 await asyncio.sleep(2)
 
 
+async def send_sma_alert(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    direction: str,
+    sma_fast: float,
+    sma_slow: float,
+    candle_open_ts: int,
+) -> None:
+    """Send a separate five-minute SMA 9/14 crossover notification."""
+    candle_time = datetime.fromtimestamp(
+        candle_open_ts / 1000, timezone.utc
+    ).strftime("%Y-%m-%d %H:%M:%S UTC")
+    direction_label = (
+        "🟢 Bullish crossover (SMA 9 moved above SMA 14)"
+        if direction == "bullish"
+        else "🔴 Bearish crossover (SMA 9 moved below SMA 14)"
+    )
+    text = (
+        "📊 *SMA 9/14 Crossover*\n"
+        "\n"
+        f"*Coin:* `{symbol}`\n"
+        "*Timeframe:* 5 minutes\n"
+        f"*Signal:* {direction_label}\n"
+        "\n"
+        f"*SMA 9:* `{sma_fast}`\n"
+        f"*SMA 14:* `{sma_slow}`\n"
+        f"*Closed candle:* `{candle_time}`"
+    )
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "Markdown",
+    }
+
+    for attempt in range(2):
+        try:
+            async with session.post(
+                f"{_API_BASE}/sendMessage",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as resp:
+                if resp.status == 200:
+                    logger.info(
+                        "SMA %s crossover sent: %s @ %s",
+                        direction,
+                        symbol,
+                        candle_time,
+                    )
+                    return
+                logger.warning(
+                    "Telegram SMA alert returned %s for %s: %s",
+                    resp.status,
+                    symbol,
+                    await resp.text(),
+                )
+        except Exception as exc:
+            logger.warning("Telegram SMA send error (attempt %d): %s", attempt + 1, exc)
+            if attempt == 0:
+                await asyncio.sleep(2)
+
+
 async def send_startup_message(
     session: aiohttp.ClientSession,
     symbol_count: int,
@@ -106,6 +167,8 @@ async def send_startup_message(
     unavailable_symbols: list[str] | None = None,
     candle_gaps: dict[str, list[str]] | None = None,
     source_summary: str | None = None,
+    sma_ready_count: int | None = None,
+    sma_requested_count: int | None = None,
 ) -> None:
     """Inform the chat that the bot has started."""
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -116,7 +179,12 @@ async def send_startup_message(
     details = [
         f"Monitoring *{symbol_count}/{requested_count}* requested symbols",
         "Timeframes: Daily · Weekly · Monthly",
+        "SMA 9/14 alerts: 5-minute closed candles",
     ]
+    if sma_ready_count is not None:
+        if sma_requested_count is None:
+            sma_requested_count = symbol_count
+        details.append(f"SMA data ready: *{sma_ready_count}/{sma_requested_count}* symbols")
     if source_summary:
         details.append(f"Sources: {source_summary}")
     if unavailable_symbols:

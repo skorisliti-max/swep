@@ -25,6 +25,7 @@ from bot.config import (
     CANDLE_FETCH_DELAY,
     CANDLE_LIMIT,
     WS_PING_INTERVAL,
+    SMA_CANDLE_LIMIT,
 )
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,50 @@ async def fetch_previous_candle(
     except (IndexError, TypeError, ValueError) as exc:
         logger.debug("Binance candle parse error %s %s: %s", symbol, bar, exc)
         return None
+
+
+async def fetch_sma_candles(
+    session: aiohttp.ClientSession,
+    symbol: str,
+    bar: str = "5m",
+) -> list[dict]:
+    """
+    Return the most recent completed Binance candles in chronological order.
+
+    Binance klines are oldest-first and the last row can still be open.
+    """
+    interval = "5m" if bar == "5m" else None
+    if interval is None:
+        logger.warning("Unsupported Binance SMA candle interval: %s", bar)
+        return []
+
+    url = f"{BINANCE_REST_BASE}/api/v3/klines"
+    params = {
+        "symbol": symbol.replace("-", ""),
+        "interval": interval,
+        "limit": SMA_CANDLE_LIMIT,
+    }
+    try:
+        async with session.get(
+            url, params=params, timeout=aiohttp.ClientTimeout(total=15)
+        ) as resp:
+            if resp.status != 200:
+                logger.debug("Binance SMA candle fetch %s HTTP %s", symbol, resp.status)
+                return []
+            rows = await resp.json()
+    except Exception as exc:
+        logger.debug("Binance SMA candle fetch error %s %s: %s", symbol, exc)
+        return []
+
+    closed_rows = rows[:-1]
+    candles: list[dict] = []
+    try:
+        for row in closed_rows:
+            candles.append({"open_ts": int(row[0]), "close": float(row[4])})
+    except (IndexError, TypeError, ValueError) as exc:
+        logger.debug("Binance SMA candle parse error %s: %s", symbol, exc)
+        return []
+    return candles
 
 
 async def bulk_fetch_candles(

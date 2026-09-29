@@ -29,21 +29,28 @@ from bot.config import (
     INSTRUMENTS_REFRESH_INTERVAL,
     ALERT_ON_LOW_SWEEP,
     ALERT_ON_HIGH_SWEEP,
+    SMA_BAR,
+    SMA_FAST_PERIOD,
+    SMA_SLOW_PERIOD,
+    SMA_REFRESH_INTERVAL,
 )
+from bot.sma import analyze_sma_cross
 from bot.okx_client import (
     fetch_usdt_spot_symbols as fetch_okx_symbols,
     fetch_previous_candle as fetch_okx_candle,
+    fetch_sma_candles as fetch_okx_sma_candles,
     bulk_fetch_candles as bulk_fetch_okx_candles,
     run_websocket_streams as run_okx_streams,
 )
 from bot.binance_client import (
     fetch_usdt_spot_symbols as fetch_binance_symbols,
     fetch_previous_candle as fetch_binance_candle,
+    fetch_sma_candles as fetch_binance_sma_candles,
     bulk_fetch_candles as bulk_fetch_binance_candles,
     run_websocket_streams as run_binance_streams,
 )
 from bot.state_manager import StateManager
-from bot.notifier import send_alert, send_startup_message
+from bot.notifier import send_alert, send_sma_alert, send_startup_message
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +63,8 @@ class Monitor:
         self._unavailable_symbols: list[str] = []
         self._candle_gaps: dict[str, list[str]] = {}
         self._loaded_bars: set[tuple[str, str]] = set()
+        # symbol → (latest closed candle timestamp, latest SMA9-SMA14 difference)
+        self._sma_state: dict[str, tuple[int, float]] = {}
         self._stop = asyncio.Event()
 
     @staticmethod
@@ -189,6 +198,89 @@ class Monitor:
                 ),
             )
 
+    async def _fetch_sma_candles(
+        self,
+        session: aiohttp.ClientSession,
+        symbol: str,
+    ) -> list[dict]:
+        if self._source_by_symbol.get(symbol) == "binance":
+            return await fetch_binance_sma_candles(session, symbol, SMA_BAR)
+        return await fetch_okx_sma_candles(session, symbol, SMA_BAR)
+
+    def _process_sma_candles(
+        self,
+        symbol: str,
+        candles: list[dict],
+    ) -> dict | None:
+        """Update the SMA baseline and return a signal only for a new cross."""
+        snapshot = analyze_sma_cross(
+            candles,
+            fast_period=SMA_FAST_PERIOD,
+            slow_period=SMA_SLOW_PERIOD,
+        )
+        if snapshot is None:
+            return None
+
+        candle_ts = snapshot["latest_open_ts"]
+        current_difference = snapshot["difference"]
+        previous_state = self._sma_state.get(symbol)
+        if previous_state is None:
+            # Establish the relationship on startup without announcing it.
+            self._sma_state[symbol] = (candle_ts, current_difference)
+            return None
+
+        previous_ts, previous_difference = previous_state
+        if candle_ts <= previous_ts:
+            return None
+
+        self._sma_state[symbol] = (candle_ts, current_difference)
+        direction: str | None = None
+        if previous_difference <= 0 < current_difference:
+            direction = "bullish"
+        elif previous_difference >= 0 > current_difference:
+            direction = "bearish"
+        if direction is None:
+            return None
+
+        return {
+            "direction": direction,
+            "sma_fast": snapshot["sma_fast"],
+            "sma_slow": snapshot["sma_slow"],
+            "candle_open_ts": candle_ts,
+        }
+
+    async def _refresh_sma_alerts(
+        self,
+        session: aiohttp.ClientSession,
+        *,
+        send_alerts: bool,
+    ) -> int:
+        """Refresh all selected symbols and optionally send new crossover alerts."""
+        async def refresh_symbol(symbol: str) -> bool:
+            try:
+                candles = await self._fetch_sma_candles(session, symbol)
+                if not candles:
+                    return False
+                signal = self._process_sma_candles(symbol, candles)
+                if signal and send_alerts:
+                    await send_sma_alert(
+                        session,
+                        symbol,
+                        signal["direction"],
+                        signal["sma_fast"],
+                        signal["sma_slow"],
+                        signal["candle_open_ts"],
+                    )
+                return True
+            except Exception as exc:
+                logger.warning("SMA refresh error for %s: %s", symbol, exc)
+                return False
+
+        results = await asyncio.gather(
+            *(refresh_symbol(symbol) for symbol in list(self._symbols))
+        )
+        return sum(results)
+
     # ── candle helpers ────────────────────────────────────────────────────────
 
     async def _load_candle(
@@ -274,6 +366,15 @@ class Monitor:
                     )
                     self._loaded_bars.add((symbol, bar))
 
+    async def _sma_refresh_loop(self, session: aiohttp.ClientSession) -> None:
+        """Check completed 5m candles often enough to catch each new crossover."""
+        while not self._stop.is_set():
+            await asyncio.sleep(SMA_REFRESH_INTERVAL)
+            if self._stop.is_set():
+                break
+            ready = await self._refresh_sma_alerts(session, send_alerts=True)
+            logger.info("SMA 9/14 refresh complete: %d/%d symbols ready", ready, len(self._symbols))
+
     async def _instruments_refresh_loop(self, session: aiohttp.ClientSession) -> None:
         """Daily refresh of the full instrument list."""
         while not self._stop.is_set():
@@ -293,6 +394,10 @@ class Monitor:
                     if previous_sources.get(symbol) not in (None, new_source_map[symbol])
                 ]
                 to_load = added + changed_source
+                for symbol in removed + changed_source:
+                    # A new source must establish its own closed-candle
+                    # baseline; provider history is not interchangeable.
+                    self._sma_state.pop(symbol, None)
                 if to_load:
                     logger.info(
                         "Loading candles for new/source-changed symbols: %s",
@@ -326,6 +431,7 @@ class Monitor:
                 len(self._symbols), len(bars),
             )
             await self._bulk_fetch_candles(session, self._symbols, bars)
+            sma_ready_count = await self._refresh_sma_alerts(session, send_alerts=False)
             logger.info(
                 "Candle init done. Monitoring %d symbols.",
                 self.state.symbol_count(),
@@ -343,6 +449,8 @@ class Monitor:
                 unavailable_symbols=self._unavailable_symbols,
                 candle_gaps=self._candle_gaps,
                 source_summary=source_summary,
+                sma_ready_count=sma_ready_count,
+                sma_requested_count=len(self._symbols),
             )
 
             # 4. Build the on_tick closure that captures the session
@@ -358,6 +466,12 @@ class Monitor:
                         name=f"candle-refresh-{bar}",
                     )
                 )
+            bg_tasks.append(
+                asyncio.create_task(
+                    self._sma_refresh_loop(session),
+                    name="sma-refresh",
+                )
+            )
             bg_tasks.append(
                 asyncio.create_task(
                     self._instruments_refresh_loop(session),
