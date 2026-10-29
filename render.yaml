@@ -11,4 +11,10 @@ services:
         sync: false
       - key: TELEGRAM_CHAT_ID
         sync: false
+      - key: ALERT_DATABASE_PATH
+        value: /var/data/alert_state.sqlite3
+    disk:
+      name: okx-sweep-state
+      mountPath: /var/data
+      sizeGB: 1
     autoDeploy: true

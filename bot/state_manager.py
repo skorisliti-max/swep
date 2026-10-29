@@ -1,9 +1,10 @@
 """
-In-memory state manager.
+State manager with persistent alert deduplication.
 
 Tracks the previous (completed) candle for every symbol × timeframe pair,
 and records which sweeps have already triggered a Telegram alert so we
-never send the same alert twice for the same candle.
+never send the same alert twice for the same candle. Alert keys are stored in
+SQLite so deduplication survives process restarts and redeploys.
 
 Layout of _state dict
 ─────────────────────
@@ -26,15 +27,47 @@ Layout of _state dict
 
 from __future__ import annotations
 
+import os
+import sqlite3
 import threading
 from typing import Optional
 
 
 class StateManager:
-    def __init__(self) -> None:
+    def __init__(self, database_path: str | None = None) -> None:
         self._lock = threading.Lock()
         # symbol → timeframe_bar → data dict
         self._state: dict[str, dict[str, dict]] = {}
+        if database_path is None:
+            database_path = os.environ.get(
+                "ALERT_DATABASE_PATH",
+                "data/alert_state.sqlite3",
+            )
+        if database_path != ":memory:":
+            os.makedirs(os.path.dirname(os.path.abspath(database_path)), exist_ok=True)
+        self._db = sqlite3.connect(
+            database_path,
+            timeout=15,
+            isolation_level=None,
+            check_same_thread=False,
+        )
+        self._db.execute("PRAGMA busy_timeout = 15000")
+        if database_path != ":memory:":
+            self._db.execute("PRAGMA journal_mode = WAL")
+        self._db.execute(
+            """
+            CREATE TABLE IF NOT EXISTS alerted_signals (
+                symbol TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                candle_open_ts INTEGER NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (
+                    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                ),
+                PRIMARY KEY (symbol, timeframe, signal_type, candle_open_ts)
+            )
+            """
+        )
 
     # ── candle updates ────────────────────────────────────────────────────────
 
@@ -104,6 +137,36 @@ class StateManager:
             candle = self._state.get(symbol, {}).get(bar)
             if candle:
                 candle["low_alerted"] = True
+
+    def claim_alert(
+        self,
+        symbol: str,
+        timeframe: str,
+        signal_type: str,
+        candle_open_ts: int,
+    ) -> bool:
+        """
+        Atomically reserve a signal key in the persistent database.
+
+        Returns True only for its first occurrence. The insert happens before
+        sending Telegram so restarts or duplicate stream ticks cannot resend
+        the same signal.
+        """
+        with self._lock:
+            cursor = self._db.execute(
+                """
+                INSERT OR IGNORE INTO alerted_signals
+                    (symbol, timeframe, signal_type, candle_open_ts)
+                VALUES (?, ?, ?, ?)
+                """,
+                (symbol, timeframe, signal_type, int(candle_open_ts)),
+            )
+            return cursor.rowcount == 1
+
+    def close(self) -> None:
+        """Close the SQLite connection when the monitor shuts down."""
+        with self._lock:
+            self._db.close()
 
     def evaluate_tick(
         self, symbol: str, bar: str, price: float

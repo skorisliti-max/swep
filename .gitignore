@@ -62,3 +62,9 @@ venv/
 
 # Environment secrets – NEVER commit
 .env
+
+# Local alert-deduplication database (Render stores this on its persistent disk).
+/data/
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal

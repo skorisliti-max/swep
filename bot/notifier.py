@@ -169,6 +169,7 @@ async def send_startup_message(
     source_summary: str | None = None,
     sma_ready_count: int | None = None,
     sma_requested_count: int | None = None,
+    alert_dedup_enabled: bool = False,
 ) -> None:
     """Inform the chat that the bot has started."""
     now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -181,6 +182,8 @@ async def send_startup_message(
         "Timeframes: Daily · Weekly · Monthly",
         "SMA 9/14 alerts: 5-minute closed candles",
     ]
+    if alert_dedup_enabled:
+        details.append("Duplicate alert protection: persistent database")
     if sma_ready_count is not None:
         if sma_requested_count is None:
             sma_requested_count = symbol_count

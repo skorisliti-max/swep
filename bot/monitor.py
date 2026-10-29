@@ -263,6 +263,20 @@ class Monitor:
                     return False
                 signal = self._process_sma_candles(symbol, candles)
                 if signal and send_alerts:
+                    signal_type = f"sma_{signal['direction']}"
+                    if not self.state.claim_alert(
+                        symbol,
+                        SMA_BAR,
+                        signal_type,
+                        signal["candle_open_ts"],
+                    ):
+                        logger.debug(
+                            "Skipping duplicate SMA alert: %s %s %s",
+                            symbol,
+                            SMA_BAR,
+                            signal["direction"],
+                        )
+                        return True
                     await send_sma_alert(
                         session,
                         symbol,
@@ -331,6 +345,20 @@ class Monitor:
                 continue
 
             sweep_type, prev_high, prev_low = result
+            candle = self.state.get_candle(symbol, bar)
+            if candle is None or not self.state.claim_alert(
+                symbol,
+                bar,
+                f"sweep_{sweep_type}",
+                candle["candle_open_ts"],
+            ):
+                logger.debug(
+                    "Skipping duplicate sweep alert: %s %s %s",
+                    symbol,
+                    bar,
+                    sweep_type,
+                )
+                continue
 
             if sweep_type == "high" and ALERT_ON_HIGH_SWEEP:
                 await send_alert(
@@ -451,6 +479,7 @@ class Monitor:
                 source_summary=source_summary,
                 sma_ready_count=sma_ready_count,
                 sma_requested_count=len(self._symbols),
+                alert_dedup_enabled=True,
             )
 
             # 4. Build the on_tick closure that captures the session
@@ -518,4 +547,5 @@ class Monitor:
                 for t in bg_tasks:
                     t.cancel()
                 await asyncio.gather(*bg_tasks, return_exceptions=True)
+                self.state.close()
                 logger.info("Monitor shut down.")
