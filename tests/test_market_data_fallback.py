@@ -15,7 +15,6 @@ from bot import monitor as monitor_module
 from bot import notifier
 from bot.config import WATCHLIST_SYMBOLS
 from bot.monitor import Monitor
-from bot.sma import analyze_sma_cross
 from bot.state_manager import StateManager
 
 
@@ -245,108 +244,7 @@ class BinanceFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(ticks, [("BTC-USDT", 123.45)])
 
-    async def test_binance_sma_candles_drop_open_candle_and_use_five_minutes(self):
-        rows = [
-            [index * 300000, "1", "2", "0", str(index), "0"]
-            for index in range(1, 17)
-        ]
-        session = FakeSession([FakeResponse(rows)])
-
-        candles = await binance_client.fetch_sma_candles(session, "BTC-USDT")
-
-        self.assertEqual(len(candles), 15)
-        self.assertEqual(candles[0], {"open_ts": 300000, "close": 1.0})
-        self.assertEqual(candles[-1], {"open_ts": 4500000, "close": 15.0})
-        self.assertEqual(session.requests[0][1]["interval"], "5m")
-
-
-class SmaAlertTests(unittest.IsolatedAsyncioTestCase):
-    @staticmethod
-    def _candles(closes: list[float]) -> list[dict]:
-        return [
-            {"open_ts": (index + 1) * 300000, "close": close}
-            for index, close in enumerate(closes)
-        ]
-
-    def test_sma_analysis_detects_latest_bullish_relationship(self):
-        snapshot = analyze_sma_cross(self._candles([10.0] * 14 + [100.0]))
-
-        self.assertIsNotNone(snapshot)
-        assert snapshot is not None
-        self.assertLessEqual(snapshot["previous_difference"], 0)
-        self.assertGreater(snapshot["difference"], 0)
-
-    def test_first_sma_observation_only_primes_without_signal(self):
-        monitor = Monitor()
-        self.addCleanup(monitor.state.close)
-        candles = self._candles([10.0] * 14 + [100.0])
-
-        self.assertIsNone(monitor._process_sma_candles("BTC-USDT", candles))
-        self.assertIn("BTC-USDT", monitor._sma_state)
-
-    def test_new_closed_candle_can_emit_bullish_signal(self):
-        monitor = Monitor()
-        self.addCleanup(monitor.state.close)
-        monitor._process_sma_candles("BTC-USDT", self._candles([10.0] * 15))
-        next_candles = [
-            {"open_ts": (index + 2) * 300000, "close": close}
-            for index, close in enumerate([10.0] * 14 + [100.0])
-        ]
-        signal = monitor._process_sma_candles(
-            "BTC-USDT",
-            next_candles,
-        )
-
-        self.assertIsNotNone(signal)
-        assert signal is not None
-        self.assertEqual(signal["direction"], "bullish")
-
-    async def test_database_blocks_same_sma_signal_after_monitor_restarts(self):
-        with tempfile.TemporaryDirectory() as directory:
-            database_path = os.path.join(directory, "alerts.sqlite3")
-            candles = self._candles([10.0] * 14 + [100.0])
-            snapshot = analyze_sma_cross(candles)
-            assert snapshot is not None
-            baseline = (
-                snapshot["latest_open_ts"] - 300000,
-                snapshot["previous_difference"],
-            )
-
-            first_monitor = Monitor()
-            first_monitor.state.close()
-            first_monitor.state = StateManager(database_path)
-            first_monitor._symbols = ["BTC-USDT"]
-            first_monitor._sma_state["BTC-USDT"] = baseline
-            with (
-                patch.object(
-                    first_monitor,
-                    "_fetch_sma_candles",
-                    AsyncMock(return_value=candles),
-                ),
-                patch.object(monitor_module, "send_sma_alert", AsyncMock()) as send_sma,
-            ):
-                await first_monitor._refresh_sma_alerts(None, send_alerts=True)
-                send_sma.assert_awaited_once()
-            first_monitor.state.close()
-
-            restarted_monitor = Monitor()
-            restarted_monitor.state.close()
-            restarted_monitor.state = StateManager(database_path)
-            restarted_monitor._symbols = ["BTC-USDT"]
-            # Simulate a stale local baseline that still sees the same cross.
-            restarted_monitor._sma_state["BTC-USDT"] = baseline
-            with (
-                patch.object(
-                    restarted_monitor,
-                    "_fetch_sma_candles",
-                    AsyncMock(return_value=candles),
-                ),
-                patch.object(monitor_module, "send_sma_alert", AsyncMock()) as send_sma,
-            ):
-                await restarted_monitor._refresh_sma_alerts(None, send_alerts=True)
-                send_sma.assert_not_awaited()
-            restarted_monitor.state.close()
-
+class SweepAlertTests(unittest.IsolatedAsyncioTestCase):
     async def test_database_blocks_same_sweep_signal_after_monitor_restarts(self):
         with tempfile.TemporaryDirectory() as directory:
             database_path = os.path.join(directory, "alerts.sqlite3")
@@ -379,19 +277,19 @@ class AlertDatabaseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             database_path = os.path.join(directory, "alerts.sqlite3")
             first = StateManager(database_path)
-            self.assertTrue(first.claim_alert("BTC-USDT", "5m", "sma_bullish", 300000))
-            self.assertFalse(first.claim_alert("BTC-USDT", "5m", "sma_bullish", 300000))
+            self.assertTrue(first.claim_alert("BTC-USDT", "1D", "sweep_low", 300000))
+            self.assertFalse(first.claim_alert("BTC-USDT", "1D", "sweep_low", 300000))
             first.close()
 
             reopened = StateManager(database_path)
             self.assertFalse(
-                reopened.claim_alert("BTC-USDT", "5m", "sma_bullish", 300000)
+                reopened.claim_alert("BTC-USDT", "1D", "sweep_low", 300000)
             )
             self.assertTrue(
-                reopened.claim_alert("BTC-USDT", "5m", "sma_bearish", 300000)
+                reopened.claim_alert("BTC-USDT", "1D", "sweep_high", 300000)
             )
             self.assertTrue(
-                reopened.claim_alert("BTC-USDT", "15m", "sma_bullish", 300000)
+                reopened.claim_alert("BTC-USDT", "1W", "sweep_low", 300000)
             )
             self.assertTrue(
                 reopened.claim_alert("BTC-USDT", "1D", "sweep_low", 600000)
@@ -418,7 +316,7 @@ class StartupMessageTests(unittest.IsolatedAsyncioTestCase):
         _url, request = session.requests[0]
         text = request["json"]["text"]
         self.assertIn("Monitoring *2/4* requested symbols", text)
-        self.assertIn("SMA 9/14 alerts: 5-minute closed candles", text)
+        self.assertNotIn("SMA", text)
         self.assertIn("Duplicate alert protection: persistent database", text)
         self.assertIn("Sources: OKX 1; Binance fallback 1", text)
         self.assertIn("*Unavailable:* `RED-USDT`, `WLD-USDT`", text)
